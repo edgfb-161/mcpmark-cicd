@@ -1,0 +1,267 @@
+name: Issue Management Automation
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  issue-triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run issue triage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            const { title, body } = context.payload.issue;
+            
+            // Define required labels with their properties
+            const requiredLabels = [
+              { name: 'bug', color: 'd73a4a', description: 'Something isn\'t working' },
+              { name: 'enhancement', color: 'a2eeef', description: 'New feature or request' },
+              { name: 'epic', color: '0056ff', description: 'Large feature requiring multiple sub-tasks' },
+              { name: 'maintenance', color: 'fef2c0', description: 'Maintenance and housekeeping tasks' },
+              { name: 'priority-critical', color: 'b60205', description: 'Critical priority issue' },
+              { name: 'priority-high', color: 'd93f0b', description: 'High priority issue' },
+              { name: 'priority-medium', color: 'fbca04', description: 'Medium priority issue' },
+              { name: 'priority-low', color: '0e8a16', description: 'Low priority issue' },
+              { name: 'needs-triage', color: 'd4c5f9', description: 'Needs to be reviewed by maintainers' },
+              { name: 'needs-review', color: 'b60205', description: 'Awaiting review from maintainers' },
+              { name: 'first-time-contributor', color: '1d76db', description: 'Issue created by first-time contributor' }
+            ];
+            
+            // Create missing labels
+            for (const label of requiredLabels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: issue.owner,
+                  repo: issue.repo,
+                  name: label.name
+                });
+              } catch (err) {
+                if (err.status === 404) {
+                  await github.rest.issues.createLabel({
+                    owner: issue.owner,
+                    repo: issue.repo,
+                    name: label.name,
+                    color: label.color,
+                    description: label.description
+                  });
+                }
+              }
+            }
+            
+            // Add initial needs-triage label
+            await github.rest.issues.addLabels({
+              owner: issue.owner,
+              repo: issue.repo,
+              issue_number: issue.number,
+              labels: ['needs-triage']
+            });
+            
+            // Add category labels based on title (case-insensitive)
+            const lowerTitle = title.toLowerCase();
+            const categoryLabels = [];
+            if (lowerTitle.includes('bug')) categoryLabels.push('bug');
+            if (lowerTitle.includes('epic')) categoryLabels.push('epic');
+            if (lowerTitle.includes('maintenance')) categoryLabels.push('maintenance');
+            
+            if (categoryLabels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: issue.owner,
+                repo: issue.repo,
+                issue_number: issue.number,
+                labels: categoryLabels
+              });
+            }
+            
+            // Add priority labels based on title/body (case-insensitive, highest priority first)
+            const lowerBody = body ? body.toLowerCase() : '';
+            const allText = `${lowerTitle} ${lowerBody}`;
+            let priorityLabel = 'priority-medium'; // Default priority
+            
+            // Check priority keywords in order of highest to lowest priority
+            if (allText.includes('critical') || allText.includes('urgent') || allText.includes('production') || allText.includes('outage')) {
+              priorityLabel = 'priority-critical';
+            } else if (allText.includes('important') || allText.includes('high') || allText.includes('blocking')) {
+              priorityLabel = 'priority-high';
+            } else if (allText.includes('low') || allText.includes('nice-to-have') || allText.includes('minor')) {
+              priorityLabel = 'priority-low';
+            }
+            
+            await github.rest.issues.addLabels({
+              owner: issue.owner,
+              repo: issue.repo,
+              issue_number: issue.number,
+              labels: [priorityLabel]
+            });
+
+  task-breakdown:
+    runs-on: ubuntu-latest
+    needs: issue-triage
+    if: contains(github.event.issue.labels.*.name, 'epic')
+    steps:
+      - name: Create epic subtasks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            const { title } = context.payload.issue;
+            const parentNumber = issue.number;
+            
+            // Define subtask names
+            const subtaskNames = [
+              'Requirements Analysis',
+              'Design and Architecture',
+              'Implementation',
+              'Testing and Documentation'
+            ];
+            
+            // Create subtasks and collect their numbers
+            const subtaskNumbers = [];
+            for (let i = 0; i < subtaskNames.length; i++) {
+              const subtaskTitle = `[SUBTASK] ${title} - Task ${i + 1}: ${subtaskNames[i]}`;
+              const subtaskBody = `Related to #${parentNumber}`;
+              
+              const subtask = await github.rest.issues.create({
+                owner: issue.owner,
+                repo: issue.repo,
+                title: subtaskTitle,
+                body: subtaskBody,
+                labels: ['enhancement', 'needs-review']
+              });
+              
+              subtaskNumbers.push(subtask.data.number);
+            }
+            
+            // Update parent issue with epic tasks checklist
+            const parentBody = context.payload.issue.body || '';
+            const epicChecklist = `
+## Epic Tasks
+- [ ] Task 1: Requirements Analysis (#${subtaskNumbers[0]})
+- [ ] Task 2: Design and Architecture (#${subtaskNumbers[1]})
+- [ ] Task 3: Implementation (#${subtaskNumbers[2]})
+- [ ] Task 4: Testing and Documentation (#${subtaskNumbers[3]})
+`;
+            
+            await github.rest.issues.update({
+              owner: issue.owner,
+              repo: issue.repo,
+              issue_number: parentNumber,
+              body: `${parentBody}\n\n${epicChecklist}`
+            });
+
+  auto-response:
+    runs-on: ubuntu-latest
+    needs: [issue-triage, task-breakdown]
+    if: always() # Run even if task-breakdown is skipped (non-epic issues)
+    steps:
+      - name: Run auto-response actions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            const { title, body, user } = context.payload.issue;
+            const issueNumber = issue.number;
+            
+            // Check if this is the user's first issue in this repository
+            const userIssues = await github.rest.issues.listForRepo({
+              owner: issue.owner,
+              repo: issue.repo,
+              creator: user.login,
+              state: 'all'
+            });
+            
+            const isFirstIssue = userIssues.data.length === 1;
+            
+            // Add first-time-contributor label and welcome message if first issue
+            if (isFirstIssue) {
+              await github.rest.issues.addLabels({
+                owner: issue.owner,
+                repo: issue.repo,
+                issue_number: issueNumber,
+                labels: ['first-time-contributor']
+              });
+              
+              const welcomeMessage = `Welcome to the project! This is your first issue here, we appreciate your contribution.`;
+              await github.rest.issues.createComment({
+                owner: issue.owner,
+                repo: issue.repo,
+                issue_number: issueNumber,
+                body: welcomeMessage
+              });
+            }
+            
+            // Get current issue labels
+            const issueLabels = context.payload.issue.labels.map(label => label.name);
+            
+            // Generate response based on issue type
+            let responseMessage = '';
+            if (issueLabels.includes('bug')) {
+              responseMessage = `Thank you for reporting this bug! Please review our [Bug Report Guidelines](.github/ISSUE_TEMPLATE/bug_report.md) to ensure all necessary information is provided.`;
+            } else if (issueLabels.includes('epic')) {
+              responseMessage = `Thank you for submitting this epic! Please review our [Feature Request Process](.github/ISSUE_TEMPLATE/feature_request.md) for more details on how we handle feature requests.`;
+            } else if (issueLabels.includes('maintenance')) {
+              responseMessage = `Thank you for submitting this maintenance task! Please review our [Maintenance Guidelines](.github/ISSUE_TEMPLATE/maintenance_report.md) for more details.`;
+            }
+            
+            // Post response if applicable
+            if (responseMessage) {
+              await github.rest.issues.createComment({
+                owner: issue.owner,
+                repo: issue.repo,
+                issue_number: issueNumber,
+                body: responseMessage
+              });
+            }
+            
+            // Set milestone for high/critical priority issues
+            if (issueLabels.includes('priority-high') || issueLabels.includes('priority-critical')) {
+              // Check if v1.0.0 milestone exists, create if not
+              let v1Milestone;
+              try {
+                const milestones = await github.rest.issues.listMilestones({
+                  owner: issue.owner,
+                  repo: issue.repo,
+                  state: 'open'
+                });
+                v1Milestone = milestones.data.find(milestone => milestone.title === 'v1.0.0');
+                
+                if (!v1Milestone) {
+                  // Create milestone if not found
+                  const newMilestone = await github.rest.issues.createMilestone({
+                    owner: issue.owner,
+                    repo: issue.repo,
+                    title: 'v1.0.0',
+                    description: 'Milestone for version 1.0.0'
+                  });
+                  v1Milestone = newMilestone.data;
+                }
+              } catch (err) {
+                console.error('Error handling milestone:', err);
+              }
+              
+              // Assign milestone to issue
+              if (v1Milestone) {
+                await github.rest.issues.update({
+                  owner: issue.owner,
+                  repo: issue.repo,
+                  issue_number: issueNumber,
+                  milestone: v1Milestone.number
+                });
+              }
+            }
+            
+            // Update status: remove needs-triage, add needs-review
+            await github.rest.issues.removeLabel({
+              owner: issue.owner,
+              repo: issue.repo,
+              issue_number: issueNumber,
+              name: 'needs-triage'
+            });
+            
+            await github.rest.issues.addLabels({
+              owner: issue.owner,
+              repo: issue.repo,
+              issue_number: issueNumber,
+              labels: ['needs-review']
+            });
